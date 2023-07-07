@@ -1,0 +1,118 @@
+---
+- name: Create a VM
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    vm_name: '{{ lookup("ansible.builtin.env", "VM_NAME") }}'
+    vm_memory: 4096 # Amount of memory in MB
+    vm_cpus: 1 # Number of CPUs
+    vm_video_memory: 128 # Amount of video memory in MB
+    vm_os_type: '{{ lookup("ansible.builtin.env", "VM_TYPE") }}'
+    vm_disk_size: 30000 # Disk size in MB
+    vm_base: '{{ lookup("ansible.builtin.env", "VM_PATH") }}' # Path to VMs base folder
+    vm_iso_path: '{{ lookup("ansible.builtin.env", "VM_ISO") }}' # Path to ISO file
+
+  tasks:
+    # CLEANUP
+    - name: Check if VM exists
+      ansible.builtin.command: vboxmanage showvminfo "{{ vm_name }}"
+      changed_when: false
+      register: vm_info
+      failed_when: false
+
+    - name: Power off VM if running
+      ansible.builtin.command: vboxmanage controlvm "{{ vm_name }}" poweroff
+      ignore_errors: yes
+      when: vm_info.rc == 0 and ('running' in vm_info.stdout or 'paused' in vm_info.stdout)
+
+    - name: Check if VM disk is attached
+      ansible.builtin.command: vboxmanage showvminfo "{{ vm_name }}" --machinereadable
+      register: disk_info
+      changed_when: false
+      when: vm_info.rc == 0
+
+    - name: Detach VM disk from SATA controller
+      ansible.builtin.command: >
+        vboxmanage storageattach "{{ vm_name }}"
+          --storagectl "SATA Controller"
+          --port 0
+          --device 0
+          --type hdd
+          --medium none
+      when: vm_info.rc == 0 and disk_info.stdout_lines is search("{{ vm_name }}.vhd")
+
+    - name: Delete VM disk if exists
+      ansible.builtin.command: vboxmanage closemedium disk "{{ vm_base }}/{{ vm_name }}/{{ vm_name }}.vhd" --delete
+      when: vm_info.rc == 0
+
+    - name: Delete VM if exists
+      ansible.builtin.command: vboxmanage unregistervm "{{ vm_name }}" --delete
+      when: vm_info.rc == 0
+
+    # CREATE VM
+    - name: Create VM
+      ansible.builtin.command: >
+        vboxmanage createvm
+          --name "{{ vm_name }}"
+          --ostype "{{ vm_os_type }}"
+          --basefolder "{{ vm_base }}"
+          --register
+      register: create_vm_result
+      changed_when: create_vm_result.rc == 0
+
+    - name: Modify VM memory and CPU
+      ansible.builtin.command: >
+        vboxmanage modifyvm "{{ vm_name }}"
+          --memory "{{ vm_memory }}"
+          --cpus "{{ vm_cpus }}"
+          --vram "{{ vm_video_memory }}"
+          --clipboard bidirectional
+          --draganddrop bidirectional
+          --graphicscontroller vmsvga
+      when: create_vm_result.changed
+
+    - name: Create VM disk
+      ansible.builtin.command: >
+        vboxmanage createmedium disk
+          --filename "{{ vm_base }}/{{ vm_name }}/{{ vm_name }}.vhd"
+          --format VHD
+          --size "{{ vm_disk_size }}"
+          --variant Standard
+      register: create_disk_result
+      changed_when: create_disk_result.rc == 0
+
+    - name: Create SATA controller
+      ansible.builtin.command: >
+        vboxmanage storagectl "{{ vm_name }}"
+          --name "SATA Controller"
+          --add sata
+          --controller IntelAHCI
+          --bootable on
+      register: create_controller_result
+      changed_when: create_controller_result.rc == 0
+
+    - name: Attach VM disk
+      ansible.builtin.command: >
+        vboxmanage storageattach "{{ vm_name }}"
+          --storagectl "SATA Controller"
+          --port 0
+          --device 0
+          --type hdd
+          --medium "{{ vm_base }}/{{ vm_name }}/{{ vm_name }}.vhd"
+      register: attach_disk_result
+      changed_when: attach_disk_result.rc == 0
+
+    - name: Attach VM ISO
+      ansible.builtin.command: >
+        vboxmanage storageattach "{{ vm_name }}"
+          --storagectl "SATA Controller"
+          --port 1
+          --device 0
+          --type dvddrive
+          --medium "{{ vm_iso_path }}"
+      when: create_disk_result.changed and vm_iso_path != ""
+
+    - name: Start VM
+      command: vboxmanage startvm "{{ vm_name }}"
+      when: create_disk_result.changed
